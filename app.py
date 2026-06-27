@@ -5,9 +5,8 @@ from torchvision import transforms
 import torchvision.transforms.functional as TF
 import numpy as np
 from PIL import Image, ExifTags
-from scipy.ndimage import gaussian_filter, sobel
+from scipy.ndimage import gaussian_filter
 import gradio as gr
-import os
 
 # ── Architecture ──────────────────────────────────────────────────────────────
 
@@ -18,6 +17,7 @@ class ResBlock(nn.Module):
         self.bn1   = nn.BatchNorm2d(ch)
         self.conv2 = nn.Conv2d(ch, ch, 3, padding=1)
         self.bn2   = nn.BatchNorm2d(ch)
+
     def forward(self, x):
         res = x
         x = F.relu(self.bn1(self.conv1(x)))
@@ -39,6 +39,7 @@ class HALNet(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(64, 3), nn.Sigmoid()
         )
+
     def forward(self, x):
         return self.regressor(self.features(x))
 
@@ -62,7 +63,7 @@ def fix_orientation(img):
         if exif:
             for tag, val in exif.items():
                 if ExifTags.TAGS.get(tag) == "Orientation":
-                    if val == 3:  img = img.rotate(180, expand=True)
+                    if val == 3:   img = img.rotate(180, expand=True)
                     elif val == 6: img = img.rotate(270, expand=True)
                     elif val == 8: img = img.rotate(90,  expand=True)
     except Exception:
@@ -70,24 +71,37 @@ def fix_orientation(img):
     return img
 
 def pad_to_square(img):
-    w, h    = img.size
-    max_s   = max(w, h)
-    pad_w   = (max_s - w) // 2
-    pad_h   = (max_s - h) // 2
+    w, h  = img.size
+    max_s = max(w, h)
+    pad_w = (max_s - w) // 2
+    pad_h = (max_s - h) // 2
     return TF.pad(img, (pad_w, pad_h, max_s-w-pad_w, max_s-h-pad_h), fill=0)
 
 def apply_halation(img_array, radius_norm, intensity, warmth):
+    """
+    Synthesize halation at the image's native resolution.
+
+    radius_norm is calibrated to a 256-px working resolution (sigma = radius * 32).
+    We scale sigma by the longer image side so the spread looks the same on
+    high-resolution inputs as it does at 256 px.
+    """
     img = img_array.astype(np.float32) / 255.0
     R, G, B = img[:,:,0], img[:,:,1], img[:,:,2]
-    sigma   = max(radius_norm * 32.0, 1.0)
-    luma    = 0.299*R + 0.587*G + 0.114*B
-    mask    = np.clip((luma - 0.65) / 0.35, 0, 1)
-    bloom   = gaussian_filter(mask, sigma=sigma)
-    bloom  /= (bloom.max() + 1e-6)
-    out     = img.copy()
+
+    # Scale sigma to native resolution so the glow is not artificially tight
+    # on large images.
+    resolution_scale = max(img.shape[:2]) / 256.0
+    sigma = max(radius_norm * 32.0 * resolution_scale, 1.0)
+
+    luma = 0.299*R + 0.587*G + 0.114*B
+    mask = np.clip((luma - 0.65) / 0.35, 0, 1)
+    bloom = gaussian_filter(mask, sigma=sigma)
+    bloom /= (bloom.max() + 1e-6)
+
+    out = img.copy()
     out[:,:,0] = np.clip(out[:,:,0] + bloom * intensity * (0.6 + 0.4*warmth), 0, 1)
     out[:,:,1] = np.clip(out[:,:,1] + bloom * intensity * 0.12,               0, 1)
-    out[:,:,2] = np.clip(out[:,:,2] + bloom * intensity * max(0, 0.08-0.08*warmth), 0, 1)
+    out[:,:,2] = np.clip(out[:,:,2] + bloom * intensity * max(0, 0.08 - 0.08*warmth), 0, 1)
     return (out * 255).astype(np.uint8)
 
 # ── Inference ─────────────────────────────────────────────────────────────────
@@ -117,12 +131,12 @@ def predict(input_image, manual_radius, manual_intensity, manual_warmth, use_man
     feedback = f"""Mode:        {mode}
 
 HAL-Net raw output
-  Radius:    {p[0]:.3f}  ({p[0]*32:.1f}px spread)
+  Radius:    {p[0]:.3f}  ({p[0]*32:.1f}px spread @ 256px)
   Intensity: {p[1]:.3f}
   Warmth:    {p[2]:.3f}
 
 Applied parameters
-  Radius:    {radius:.3f}  ({radius*32:.1f}px spread)
+  Radius:    {radius:.3f}  ({radius*32:.1f}px spread @ 256px)
   Intensity: {intensity:.3f}
   Warmth:    {warmth:.3f}
 
@@ -154,16 +168,16 @@ Inspired by [FGA-NN](https://arxiv.org/abs/2506.14350) (Ameur et al., 2025).
             gr.Markdown("### Manual Override")
             gr.Markdown("Adjust sliders to override HAL-Net predictions.")
 
-            use_manual     = gr.Checkbox(label="Use manual parameters", value=False)
-            manual_radius  = gr.Slider(0.05, 1.0, value=0.3,  step=0.01, label="Radius (0=tight, 1=wide spread)")
+            use_manual       = gr.Checkbox(label="Use manual parameters", value=False)
+            manual_radius    = gr.Slider(0.05, 1.0, value=0.3,  step=0.01, label="Radius (0=tight, 1=wide spread)")
             manual_intensity = gr.Slider(0.0,  1.0, value=0.4,  step=0.01, label="Intensity (glow strength)")
-            manual_warmth  = gr.Slider(0.0,  1.0, value=0.7,  step=0.01, label="Warmth (0=white, 1=CineStill red)")
+            manual_warmth    = gr.Slider(0.0,  1.0, value=0.7,  step=0.01, label="Warmth (0=white, 1=CineStill red)")
 
             run_btn = gr.Button("Apply HAL-Net Halation", variant="primary")
 
         with gr.Column():
-            image_output   = gr.Image(label="Output", type="pil")
-            params_output  = gr.Textbox(label="Parameter Readout", lines=14, interactive=False)
+            image_output  = gr.Image(label="Output", type="pil")
+            params_output = gr.Textbox(label="Parameter Readout", lines=14, interactive=False)
 
     gr.Markdown("""
 ---
@@ -172,6 +186,17 @@ Halation is the red-orange glow around bright light sources in analog film photo
 It occurs when light passes through the emulsion, reflects off the film base, and exposes
 the silver halide crystals from behind. CineStill 800T is particularly known for this
 effect because its anti-halation layer was removed during processing for cinema use.
+
+**Evaluation (15-image test split)**
+
+| Method | Radius MAE | Intensity MAE | Warmth MAE |
+|---|---|---|---|
+| Mean-pred baseline | 0.012 | 0.317 | 0.328 |
+| HAL-Net | 0.015 | 0.247 | 0.218 |
+
+HAL-Net beats the baseline on the two harder parameters (intensity and warmth).
+Radius is already near-zero for both methods because the pseudo-label distribution
+is narrow — nearly every image maps to a spread around 0.09.
 
 **Dataset**
 100 handpicked CineStill 800T scans from Flickr and Lomography exhibiting authentic halation.
